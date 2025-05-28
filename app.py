@@ -1,15 +1,21 @@
-
+# ==================== Imports and Backend =========================
 import streamlit as st
 import pandas as pd
 import numpy as np
 import pyomo.environ as pyo
 from pyomo.opt import SolverManagerFactory
 from math import log10, pi
+import networkx as nx
+from pyvis.network import Network
+import streamlit.components.v1 as components
+import tempfile
 import os
 
+# ------------- Pyomo Pipeline Optimization Backend ----------------
 os.environ['NEOS_EMAIL'] = os.environ.get('NEOS_EMAIL', 'youremail@example.com')
 
 def solve_pipeline(stations, terminal, FLOW, KV_list, rho_list, RateDRA, Price_HSD):
+
     model = pyo.ConcreteModel()
     N = len(stations)
     model.I = pyo.RangeSet(1, N)
@@ -283,24 +289,29 @@ def solve_pipeline(stations, terminal, FLOW, KV_list, rho_list, RateDRA, Price_H
     result['total_cost'] = float(pyo.value(model.Obj))
     return result
 
-# ==================== CHUNK 2: Streamlit UI =========================
+
+# =================== Streamlit App Frontend =======================
 
 st.set_page_config(page_title="Pipeline Network Optimizer", layout="wide")
 st.title("Pipeline Network Optimizer")
 
-st.header("Stations (including branches and tap-off points)")
+# 1. Editable Table Input for Mainline and Branches
+st.header("Pipeline Network: Stations (Mainline & Branches)")
 if "stations" not in st.session_state:
     st.session_state["stations"] = []
 
-stations_df = pd.DataFrame(st.session_state["stations"])
 columns = [
     "name", "L", "D", "t", "rough", "SMYS", "DF", "elev", "is_pump", "min_residual",
-    "A", "B", "C", "P", "Q", "R", "S", "T", "MinRPM", "DOL", "max_pumps", "sfc", "rate", "max_dr", "peaks"
+    "A", "B", "C", "P", "Q", "R", "S", "T", "MinRPM", "DOL", "max_pumps", "sfc", "rate", "max_dr",
+    "peaks", "upstream", "downstream"
 ]
 display_columns = columns
 
+stations_df = pd.DataFrame(st.session_state["stations"])
 if stations_df.empty:
     stations_df = pd.DataFrame([{col: "" for col in columns}])
+
+st.info("Fill in one row per station/branch/tap-off. 'upstream' and 'downstream' must be station names (for visualization and branches). Peaks = e.g. [{'loc':12.0,'elev':304.2}]")
 
 edited = st.data_editor(stations_df[display_columns], num_rows="dynamic", key="station_editor")
 if st.button("Save Stations"):
@@ -317,6 +328,7 @@ if st.button("Save Stations"):
     st.session_state["stations"] = data
     st.success("Stations saved!")
 
+# 2. Terminal Node Input
 st.header("Terminal Node")
 if "terminal" not in st.session_state:
     st.session_state["terminal"] = {"name": "Terminal", "elev": 0.0, "min_residual": 50.0}
@@ -326,6 +338,7 @@ terminal["elev"] = st.number_input("Terminal Elevation (m)", value=float(termina
 terminal["min_residual"] = st.number_input("Minimum Required RH at Terminal (m)", value=float(terminal.get("min_residual", 50.0)), step=1.0)
 st.session_state["terminal"] = terminal
 
+# 3. Fluid Properties Table
 st.header("Fluid Properties (per station except terminal)")
 if "KV_list" not in st.session_state or len(st.session_state["KV_list"]) != len(st.session_state["stations"]):
     st.session_state["KV_list"] = [1.0] * len(st.session_state["stations"])
@@ -344,11 +357,44 @@ for i, stn in enumerate(st.session_state["stations"]):
 st.session_state["KV_list"] = KV_list
 st.session_state["rho_list"] = rho_list
 
+# 4. Operating and Cost Parameters
 st.header("Operating Parameters")
 FLOW = st.number_input("Flow Rate (m3/hr)", value=1000.0, min_value=0.0, step=10.0)
 RateDRA = st.number_input("DRA Cost (per L)", value=0.0, step=0.1)
 Price_HSD = st.number_input("Diesel Price (per L)", value=90.0, step=1.0)
 
+# 5. Network Visualization with networkx + pyvis
+st.header("Pipeline Network Visualization")
+try:
+    net = Network(height="500px", width="100%", bgcolor="#222222", font_color="white", directed=True)
+    G = nx.DiGraph()
+    for stn in st.session_state["stations"]:
+        net.add_node(stn["name"], label=stn["name"], color="red" if stn["is_pump"] else "blue")
+        G.add_node(stn["name"])
+    # Draw edges
+    for stn in st.session_state["stations"]:
+        if stn.get("upstream") and stn.get("downstream"):
+            net.add_edge(stn["upstream"], stn["name"], color="gray")
+            net.add_edge(stn["name"], stn["downstream"], color="gray")
+            G.add_edge(stn["upstream"], stn["name"])
+            G.add_edge(stn["name"], stn["downstream"])
+        elif stn.get("upstream"):
+            net.add_edge(stn["upstream"], stn["name"], color="gray")
+            G.add_edge(stn["upstream"], stn["name"])
+        elif stn.get("downstream"):
+            net.add_edge(stn["name"], stn["downstream"], color="gray")
+            G.add_edge(stn["name"], stn["downstream"])
+    net.add_node(terminal["name"], label=terminal["name"], color="green")
+    for stn in st.session_state["stations"]:
+        if stn.get("downstream") == terminal["name"]:
+            net.add_edge(stn["name"], terminal["name"], color="green")
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as temp_html:
+        net.save_graph(temp_html.name)
+        components.html(open(temp_html.name, 'r', encoding='utf-8').read(), height=520)
+except Exception as e:
+    st.warning(f"Network visualization failed: {e}")
+
+# 6. Run Optimization
 st.header("Run Optimization")
 if st.button("Optimize Pipeline Network"):
     st.info("Running optimization (please wait for NEOS solution)...")
@@ -390,6 +436,7 @@ st.markdown("---")
 st.info("""
 **Instructions**
 - Enter all stations (mainline, branches, tap-off points) above. Use "peaks" column to specify elevation peaks as a list of dicts (e.g., `[{"loc": 12.0, "elev": 304.2}]`).
+- Use 'upstream'/'downstream' columns to define branches, loops, tap-offs.
 - Mark stations as pump stations by setting "is_pump" to True.
 - Set all pump and cost data as needed for each station.
 - Enter fluid properties per segment.
