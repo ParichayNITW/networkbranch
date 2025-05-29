@@ -1,6 +1,7 @@
 streamlit
-pyomo
 pandas
 numpy
+pyomo
 networkx
-pyvis
+matplotlib
+plotly
