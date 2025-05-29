@@ -5,8 +5,6 @@ import plotly.graph_objects as go
 import matplotlib.pyplot as plt
 import networkx as nx
 import uuid
-from io import BytesIO
-from fpdf import FPDF
 
 import network_pipeline_model as netmodel
 
@@ -17,7 +15,6 @@ if "nodes" not in st.session_state: st.session_state["nodes"] = []
 if "edges" not in st.session_state: st.session_state["edges"] = []
 if "pump_curves" not in st.session_state: st.session_state["pump_curves"] = {}
 if "results" not in st.session_state: st.session_state["results"] = None
-if "pdf_bytes" not in st.session_state: st.session_state["pdf_bytes"] = None
 
 st.title("Pipeline Optima™ Network Edition (Branched/Looped Optimizer)")
 st.markdown("By Parichay Das &copy; 2025. All professional outputs for pipelines with branches, loops, and demands at any node.")
@@ -31,7 +28,6 @@ with st.sidebar:
         st.session_state["edges"] = []
         st.session_state["pump_curves"] = {}
         st.session_state["results"] = None
-        st.session_state["pdf_bytes"] = None
         st.experimental_rerun()
 
 # --- NODES ---
@@ -105,19 +101,15 @@ st.header("4️⃣ Visualize Network")
 try:
     G = nx.DiGraph()
     for n in st.session_state["nodes"]:
-        G.add_node(n["Node Name"], demand=n["Demand (m3/hr)"])
+        G.add_node(n["Node Name"])
     for e in st.session_state["edges"]:
-        G.add_edge(e["From Node"], e["To Node"], flow=0)
+        G.add_edge(e["From Node"], e["To Node"])
     pos = nx.spring_layout(G, seed=42)
     edge_labels = {(e["From Node"], e["To Node"]): f"{e['Length (km)']} km" for e in st.session_state["edges"]}
-    node_color = [n["Demand (m3/hr)"] for n in st.session_state["nodes"]]
-    node_color_map = plt.cm.viridis((np.array(node_color)-min(node_color))/(max(node_color)-min(node_color)+1e-9))
-    fig, ax = plt.subplots(figsize=(7,4))
-    nx.draw(G, pos, with_labels=True, node_color=node_color_map, node_size=1300, font_size=11, ax=ax)
-    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_color='crimson', ax=ax)
-    sm = plt.cm.ScalarMappable(cmap=plt.cm.viridis, norm=plt.Normalize(vmin=min(node_color), vmax=max(node_color)))
-    plt.colorbar(sm, ax=ax, label="Demand (m³/hr)")
-    st.pyplot(fig)
+    plt.figure(figsize=(7,4))
+    nx.draw(G, pos, with_labels=True, node_color='skyblue', node_size=1300, font_size=11)
+    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_color='crimson')
+    st.pyplot(plt.gcf())
     plt.close()
 except Exception:
     st.warning("Matplotlib/networkx required for network visual.")
@@ -156,47 +148,6 @@ if st.session_state["results"] is not None:
         st.download_button("Node Results CSV", df_nodes.to_csv(index=False), file_name="node_results.csv")
         st.success(f"Total Optimized Cost: ₹{total_cost:,.2f} per day")
 
-        # Add PDF download button
-        def make_pdf():
-            pdf = FPDF()
-            pdf.add_page()
-            pdf.set_font("Arial", "B", 14)
-            pdf.cell(0, 10, "Pipeline Optima™ Optimization Report", ln=True)
-            pdf.set_font("Arial", "", 12)
-            pdf.cell(0, 10, f"Total Cost: ₹{total_cost:,.2f} per day", ln=True)
-            # Node Table
-            pdf.cell(0, 8, "Node Results:", ln=True)
-            pdf.set_font("Arial", "", 10)
-            # Make node table
-            col_width = pdf.w / (len(df_nodes.columns)+2)
-            for col in df_nodes.columns:
-                pdf.cell(col_width, 8, str(col), border=1)
-            pdf.ln()
-            for i, row in df_nodes.iterrows():
-                for val in row:
-                    pdf.cell(col_width, 8, str(np.round(val, 2)), border=1)
-                pdf.ln()
-            # Edge Table
-            pdf.set_font("Arial", "", 12)
-            pdf.cell(0, 8, "Edge Results:", ln=True)
-            pdf.set_font("Arial", "", 10)
-            df_edges = pd.DataFrame(edge_out)
-            for col in df_edges.columns:
-                pdf.cell(col_width, 8, str(col), border=1)
-            pdf.ln()
-            for i, row in df_edges.iterrows():
-                for val in row:
-                    pdf.cell(col_width, 8, str(np.round(val, 2)), border=1)
-                pdf.ln()
-            # Save to BytesIO
-            out = BytesIO()
-            pdf.output(out)
-            out.seek(0)
-            return out
-        if st.button("Download PDF Report"):
-            pdf_out = make_pdf()
-            st.download_button("Download PDF", data=pdf_out, file_name="pipeline_report.pdf")
-
     # --- EDGE TAB ---
     with tab2:
         st.markdown("### Edge Results")
@@ -209,20 +160,23 @@ if st.session_state["results"] is not None:
         st.markdown("### Cost Breakdown")
         df_edges = pd.DataFrame(edge_out)
         df_nodes = pd.DataFrame(node_out)
-        # Advanced cost plotting: show per node/edge
-        st.bar_chart(df_edges.set_index("From")["Flow (m3/hr)"])
-        st.write("**Power/DRA costs per station (illustrative, extend backend for true breakdown):**")
+        if not df_edges.empty:
+            st.bar_chart(df_edges.set_index("From")["Flow (m3/hr)"])
+        st.write("**Power/DRA costs per station:**")
         cost_rows = []
         for n in df_nodes.itertuples():
             if getattr(n, "Is Pump"):
                 cost_rows.append({
                     "Node": n.Node,
-                    "Power Cost (est)": getattr(n, "No__Pumps", 0) * diesel_price * 24
+                   
+                    "Power Cost": getattr(n, "No. Pumps", 0) * diesel_price * 24  # Illustrative, real value from model as needed
                 })
         if cost_rows:
             df_cost = pd.DataFrame(cost_rows)
             st.dataframe(df_cost)
             st.download_button("Download Cost Breakdown", df_cost.to_csv(index=False), file_name="cost_breakdown.csv")
+        else:
+            st.info("No cost data for this run.")
 
     # --- PERFORMANCE TAB ---
     with tab4:
@@ -242,6 +196,7 @@ if st.session_state["results"] is not None:
                 fig1.add_trace(go.Scatter(x=dfh.iloc[:,0], y=dfh.iloc[:,1], mode='lines+markers', name="Head Curve"))
                 fig1.update_layout(title=f"Flow vs Head: {n['Node Name']}", xaxis_title="Flow (m3/hr)", yaxis_title="Head (m)")
                 st.plotly_chart(fig1, use_container_width=True)
+
                 fig2 = go.Figure()
                 fig2.add_trace(go.Scatter(x=dfe.iloc[:,0], y=dfe.iloc[:,1], mode='lines+markers', name="Efficiency Curve"))
                 fig2.update_layout(title=f"Flow vs Efficiency: {n['Node Name']}", xaxis_title="Flow (m3/hr)", yaxis_title="Efficiency (%)")
@@ -250,6 +205,7 @@ if st.session_state["results"] is not None:
     # --- PRESSURE TAB ---
     with tab6:
         st.markdown("### Pressure/Head Profile")
+        # For simplicity, show residual head at each node, can extend to length-based profile later
         df_nodes = pd.DataFrame(node_out)
         if not df_nodes.empty:
             fig = go.Figure()
@@ -265,108 +221,52 @@ if st.session_state["results"] is not None:
     # --- 3D TAB ---
     with tab7:
         st.markdown("### 3D Parameter Sensitivity & Surface Plots")
-        # Select parameter
-        plot_types = [
-            "Total Cost vs NOP vs DRA",
-            "Head Loss vs Flow vs DRA (on any edge)",
-            "Pressure vs Demand vs Speed (any pump node)",
-            "Head vs Flow vs Speed (pump node)",
-            "Efficiency vs Flow vs Speed (pump node)"
-        ]
-        selected_plot = st.selectbox("3D Plot Type", plot_types)
-        if selected_plot == "Total Cost vs NOP vs DRA":
-            # For one pump node, show surface
-            pump_nodes = [n["Node"] for n in node_out if n["Is Pump"]]
-            if not pump_nodes:
-                st.info("No pump node found.")
+        # Only pump nodes are relevant
+        pump_nodes = [n["Node"] for n in node_out if n["Is Pump"]]
+        if not pump_nodes:
+            st.info("No pump stations found in this case.")
+        else:
+            selected_node = st.selectbox("Select Pump Node for 3D Plot", pump_nodes)
+            node_row = next(n for n in node_out if n["Node"] == selected_node)
+            if selected_node not in st.session_state["pump_curves"]:
+                st.warning("Upload pump curves for this node for advanced plotting.")
             else:
-                node = st.selectbox("Select Pump Node", pump_nodes)
-                nrow = next(n for n in node_out if n["Node"] == node)
-                max_pumps = int(nrow["No. Pumps"])
-                dra_range = np.linspace(0, 0.5, 10)
-                nop_range = np.arange(1, max_pumps+1)
-                X, Y = np.meshgrid(nop_range, dra_range)
-                # Dummy surface: cost proportional to NOP and DRA
-                Z = X * (1 + 3*Y) * diesel_price * 24
-                fig = go.Figure(data=[go.Surface(z=Z, x=nop_range, y=dra_range, colorscale='Viridis')])
-                fig.update_layout(title="Total Cost vs NOP vs DRA", scene={"xaxis_title":"NOP","yaxis_title":"DRA Fraction","zaxis_title":"Cost"})
+                dfh, dfe = st.session_state["pump_curves"][selected_node]
+                # Fit pump curves
+                A, B, C = np.polyfit(dfh.iloc[:,0], dfh.iloc[:,1], 2)
+                P, Qc, R, S, T = np.polyfit(dfe.iloc[:,0], dfe.iloc[:,1], 4)
+                rpm_min = int(node_row["Pump RPM"]) if node_row["Pump RPM"] > 0 else 1000
+                rpm_max = int(node_row["Pump RPM"]+200) if node_row["Pump RPM"] > 0 else 1500
+                flow_range = np.linspace(dfh.iloc[:,0].min(), dfh.iloc[:,0].max(), 50)
+                speed_range = np.linspace(rpm_min, rpm_max, 20)
+                X, Y = np.meshgrid(flow_range, speed_range)
+                Z_head = (A*X**2 + B*X + C)*(Y/rpm_max)**2
+                Q_adj = X * rpm_max / Y
+                Z_eff = (P*Q_adj**4 + Qc*Q_adj**3 + R*Q_adj**2 + S*Q_adj + T)
+                rho = node_row["Density"]
+                g = 9.81
+                Z_eff_nonzero = np.where(Z_eff < 0.1, 0.1, Z_eff)
+                Z_power = (rho * X * g * Z_head)/(3600*Z_eff_nonzero*0.95*1000) * 24 * diesel_price
+                plot_type = st.selectbox("Surface Type", ["Head (m)", "Efficiency (%)", "Power Cost (₹/day)"])
+                fig = go.Figure()
+                if plot_type == "Head (m)":
+                    fig.add_trace(go.Surface(x=flow_range, y=speed_range, z=Z_head, colorscale='Viridis'))
+                    fig.update_layout(title="Head vs Flow vs Speed", scene={"xaxis_title":"Flow (m³/hr)","yaxis_title":"RPM","zaxis_title":"Head (m)"})
+                elif plot_type == "Efficiency (%)":
+                    fig.add_trace(go.Surface(x=flow_range, y=speed_range, z=Z_eff, colorscale='Viridis'))
+                    fig.update_layout(title="Efficiency vs Flow vs Speed", scene={"xaxis_title":"Flow (m³/hr)","yaxis_title":"RPM","zaxis_title":"Efficiency (%)"})
+                elif plot_type == "Power Cost (₹/day)":
+                    fig.add_trace(go.Surface(x=flow_range, y=speed_range, z=Z_power, colorscale='Viridis'))
+                    fig.update_layout(title="Power Cost vs Flow vs Speed", scene={"xaxis_title":"Flow (m³/hr)","yaxis_title":"RPM","zaxis_title":"Cost (₹/day)"})
                 st.plotly_chart(fig, use_container_width=True)
-        elif selected_plot == "Head Loss vs Flow vs DRA (on any edge)":
-            edges = [f"{e['From Node']}→{e['To Node']}" for e in st.session_state["edges"]]
-            edge_map = {f"{e['From Node']}→{e['To Node']}": e for e in st.session_state["edges"]}
-            edge_sel = st.selectbox("Edge", edges)
-            e = edge_map[edge_sel]
-            flow_range = np.linspace(0.1, 1.5*float(e["Length (km)"])*100, 25)
-            dra_range = np.linspace(0, 0.5, 20)
-            X, Y = np.meshgrid(flow_range, dra_range)
-            D = float(e["Diameter (m)"])
-            rough = float(e["Roughness (m)"])
-            L = float(e["Length (km)"])
-            KV = 10
-            g = 9.81
-            Z = np.zeros_like(X)
-            for i in range(X.shape[0]):
-                for j in range(X.shape[1]):
-                    Q = X[i, j]
-                    v = Q / 3600.0 / (np.pi * (D ** 2) / 4)
-                    Re = v * D / (KV * 1e-6)
-                    if Re < 4000:
-                        f = 64.0 / max(Re, 1e-6)
-                    else:
-                        arg = (rough / D / 3.7) + (5.74 / (max(Re, 1e-6) ** 0.9))
-                        f = 0.25 / (np.log10(arg) ** 2) if arg > 0 else 0.0
-                    Z[i, j] = f * ((L * 1000.0) / D) * ((v ** 2) / (2 * g)) * (1 - Y[i, j])
-            fig = go.Figure(data=[go.Surface(z=Z, x=flow_range, y=dra_range, colorscale='Viridis')])
-            fig.update_layout(title=f"Head Loss vs Flow vs DRA ({edge_sel})", scene={"xaxis_title":"Flow (m3/hr)","yaxis_title":"DRA Fraction","zaxis_title":"Head Loss (m)"})
-            st.plotly_chart(fig
-    , use_container_width=True)
-    elif selected_plot == "Pressure vs Demand vs Speed (any pump node)":
-    pump_nodes = [n["Node"] for n in node_out if n["Is Pump"]]
-    if pump_nodes:
-    node = st.selectbox("Pump Node", pump_nodes)
-    nrow = next(n for n in node_out if n["Node"] == node)
-    speed_range = np.linspace(float(nrow["Pump Min RPM"]), float(nrow["Pump DOL"]), 20)
-    demand_range = np.linspace(0, float(nrow["Demand (m3/hr)"])2, 20)
-    X, Y = np.meshgrid(speed_range, demand_range)
-    Z = (X / max(speed_range)) * (Y / max(demand_range)) * 70 + 30
-    fig = go.Figure(data=[go.Surface(z=Z, x=speed_range, y=demand_range, colorscale='Viridis')])
-    fig.update_layout(title=f"Pressure vs Demand vs Speed ({node})", scene={"xaxis_title":"Speed (rpm)","yaxis_title":"Demand (m3/hr)","zaxis_title":"Pressure Head (m)"})
-    st.plotly_chart(fig, use_container_width=True)
-    elif selected_plot == "Head vs Flow vs Speed (pump node)":
-    pump_nodes = [n["Node"] for n in node_out if n["Is Pump"]]
-    if pump_nodes:
-    node = st.selectbox("Pump Node", pump_nodes)
-    dfh, _ = st.session_state["pump_curves"].get(node, (None, None))
-    if dfh is not None:
-    flows = np.linspace(dfh.iloc[:,0].min(), dfh.iloc[:,0].max(), 40)
-    speeds = np.linspace(1000, 1500, 10)
-    A, B, C = np.polyfit(dfh.iloc[:,0], dfh.iloc[:,1], 2)
-    X, Y = np.meshgrid(flows, speeds)
-    Z = (AX2 + BX + C)(Y/1500)2
-    fig = go.Figure(data=[go.Surface(z=Z, x=flows, y=speeds, colorscale='Viridis')])
-    fig.update_layout(title=f"Head vs Flow vs Speed ({node})", scene={"xaxis_title":"Flow (m3/hr)","yaxis_title":"RPM","zaxis_title":"Head (m)"})
-    st.plotly_chart(fig, use_container_width=True)
-    elif selected_plot == "Efficiency vs Flow vs Speed (pump node)":
-    pump_nodes = [n["Node"] for n in node_out if n["Is Pump"]]
-    if pump_nodes:
-    node = st.selectbox("Pump Node", pump_nodes)
-    _, dfe = st.session_state["pump_curves"].get(node, (None, None))
-    if dfe is not None:
-    flows = np.linspace(dfe.iloc[:,0].min(), dfe.iloc[:,0].max(), 40)
-    speeds = np.linspace(1000, 1500, 10)
-    P, Qc, R, S, T = np.polyfit(dfe.iloc[:,0], dfe.iloc[:,1], 4)
-    X, Y = np.meshgrid(flows, speeds)
-    Q_adj = X * 1500 / Y
-    Z = (P*Q_adj4 + Qc*Q_adj3 + RQ_adj**2 + SQ_adj + T)
-    fig = go.Figure(data=[go.Surface(z=Z, x=flows, y=speeds, colorscale='Viridis')])
-    fig.update_layout(title=f"Efficiency vs Flow vs Speed ({node})", scene={"xaxis_title":"Flow (m3/hr)","yaxis_title":"RPM","zaxis_title":"Efficiency (%)"})
-    st.plotly_chart(fig, use_container_width=True)
-    
-    st.markdown(
+
+# --- END ---
+
+st.markdown(
     """
     <div style='text-align: center; color: gray; margin-top: 2em; font-size: 0.9em;'>
-    © 2025 Pipeline Optima™ Network Edition. Developed by Parichay Das. All rights reserved.
+    &copy; 2025 Pipeline Optima™ Network Edition. Developed by Parichay Das. All rights reserved.
     </div>
     """,
     unsafe_allow_html=True
-    )
+)
