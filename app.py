@@ -1,272 +1,194 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
-import matplotlib.pyplot as plt
-import networkx as nx
-import uuid
+import pyomo.environ as pyo
+from pyomo.opt import SolverManagerFactory
+from math import pi, log10
 
-import network_pipeline_model as netmodel
+def solve_batch_pipeline(
+    nodes, edges, pumps, peaks, demands, time_horizon_hours,
+    dra_cost_per_litre, diesel_price, grid_price,
+    min_velocity=0.5, max_velocity=3.0
+):
+    m = pyo.ConcreteModel()
 
-st.set_page_config(page_title="Pipeline Optima™ Network", layout="wide")
-st.markdown("<style>div.block-container{padding-top:1rem;}</style>", unsafe_allow_html=True)
+    # ---- SETS ----
+    m.T = pyo.RangeSet(1, time_horizon_hours)
+    m.N = pyo.Set(initialize=[n['id'] for n in nodes])
+    m.E = pyo.Set(initialize=[e['id'] for e in edges])
+    m.PUMP = pyo.Set(initialize=[p['id'] for p in pumps])
 
-if "nodes" not in st.session_state: st.session_state["nodes"] = []
-if "edges" not in st.session_state: st.session_state["edges"] = []
-if "pump_curves" not in st.session_state: st.session_state["pump_curves"] = {}
-if "results" not in st.session_state: st.session_state["results"] = None
+    edge_from = {e['id']: e['from_node'] for e in edges}
+    edge_to   = {e['id']: e['to_node'] for e in edges}
+    pump_node = {p['id']: p['node_id'] for p in pumps}
+    pump_branch_to = {p['id']: p.get('branch_to', edge_to.get(p['main_edge'], None)) for p in pumps}
 
-st.title("Pipeline Optima™ Network Edition (Branched/Looped Optimizer)")
-st.markdown("By Parichay Das &copy; 2025. All professional outputs for pipelines with branches, loops, and demands at any node.")
+    length = {e['id']: e['length_km']*1000 for e in edges}
+    diameter = {e['id']: e['diameter_m'] for e in edges}
+    thickness = {e['id']: e['thickness_m'] for e in edges}
+    roughness = {e['id']: e.get('roughness', 0.00004) for e in edges}
+    max_dr = {e['id']: e.get('max_dr', 0.0) for e in edges}
 
-with st.sidebar:
-    st.header("Global Cost Parameters")
-    dra_cost = st.number_input("DRA Cost (INR/L)", value=500.0)
-    diesel_price = st.number_input("Diesel Price (INR/L)", value=90.0)
-    if st.button("Reset Everything"):
-        st.session_state["nodes"] = []
-        st.session_state["edges"] = []
-        st.session_state["pump_curves"] = {}
-        st.session_state["results"] = None
-        st.experimental_rerun()
+    elev = {n['id']: n['elevation'] for n in nodes}
+    density = {n['id']: n['density'] for n in nodes}
+    viscosity = {n['id']: n['viscosity'] for n in nodes}
 
-# --- NODES ---
-st.header("1️⃣ Define Nodes (Stations, Demand, Junctions)")
-if st.button("Add Node"):
-    st.session_state["nodes"].append({
-        "Node Name": f"Node{len(st.session_state['nodes'])+1}",
-        "Elevation (m)": 0.0,
-        "Demand (m3/hr)": 0.0,
-        "Density (kg/m3)": 850.0,
-        "Viscosity (cSt)": 10.0,
-        "Is Pump?": "No",
-        "Pump Min RPM": 1000.0,
-        "Pump DOL": 1500.0,
-        "No. of Pumps": 1,
-    })
-if len(st.session_state["nodes"]) > 0:
-    nodes_df = pd.DataFrame(st.session_state["nodes"])
-    edited = st.data_editor(
-        nodes_df,
-        column_config={
-            "Is Pump?": st.column_config.SelectboxColumn(options=["No", "Yes"])
-        },
-        num_rows="dynamic"
-    )
-    st.session_state["nodes"] = edited.fillna("").to_dict(orient="records")
+    # Costs and bounds
+    m.dra_cost = pyo.Param(initialize=dra_cost_per_litre)
+    m.diesel_price = pyo.Param(initialize=diesel_price)
+    m.grid_price = pyo.Param(initialize=grid_price)
+    m.min_v = pyo.Param(initialize=min_velocity)
+    m.max_v = pyo.Param(initialize=max_velocity)
 
-# --- EDGES ---
-st.header("2️⃣ Define Edges (Segments/Branches/Loops)")
-if len(st.session_state["nodes"]) > 1:
-    nlist = [n["Node Name"] for n in st.session_state["nodes"]]
-    if st.button("Add Edge"):
-        st.session_state["edges"].append({
-            "From Node": nlist[0],
-            "To Node": nlist[1],
-            "Length (km)": 50.0,
-            "Diameter (m)": 0.7,
-            "Wall Thickness (m)": 0.007,
-            "Roughness (m)": 0.00004,
-            "Max Achievable DR (%)": 40.0
-        })
-    if len(st.session_state["edges"]) > 0:
-        edges_df = pd.DataFrame(st.session_state["edges"])
-        edited_edges = st.data_editor(
-            edges_df,
-            column_config={
-                "From Node": st.column_config.SelectboxColumn(options=nlist),
-                "To Node": st.column_config.SelectboxColumn(options=nlist)
-            },
-            num_rows="dynamic"
-        )
-        st.session_state["edges"] = edited_edges.fillna("").to_dict(orient="records")
+    demand_nodes = set(demands.keys())
+    m.demand_nodes = pyo.Set(initialize=demand_nodes)
+    m.demand_vol = pyo.Param(m.demand_nodes, initialize=demands)
+    edge_peaks = peaks
 
-# --- PUMP CURVES ---
-st.header("3️⃣ Upload Pump Curves (for Pump Nodes Only)")
-for idx, node in enumerate(st.session_state["nodes"]):
-    if node["Is Pump?"] == "Yes":
-        st.markdown(f"#### Pump Curves for **{node['Node Name']}**")
-        fh = st.file_uploader(f"Flow vs Head CSV ({node['Node Name']})", type="csv", key=f"fh_{idx}")
-        fe = st.file_uploader(f"Flow vs Efficiency CSV ({node['Node Name']})", type="csv", key=f"fe_{idx}")
-        if fh and fe:
-            dfh = pd.read_csv(fh)
-            dfe = pd.read_csv(fe)
-            st.session_state["pump_curves"][node['Node Name']] = (dfh, dfe)
-            st.success(f"Curves loaded for {node['Node Name']}")
-        elif node['Node Name'] in st.session_state["pump_curves"]:
-            st.info(f"Curves already loaded for {node['Node Name']}")
+    # ---- VARIABLES ----
+    m.flow = pyo.Var(m.E, m.T, domain=pyo.NonNegativeReals)
+    def dra_bounds(m, e, t): return (0, max_dr[e])
+    m.dra = pyo.Var(m.E, m.T, domain=pyo.NonNegativeReals, bounds=dra_bounds)
+    m.rh = pyo.Var(m.N, m.T, domain=pyo.NonNegativeReals)
 
-# --- NETWORK GRAPH ---
-st.header("4️⃣ Visualize Network")
-try:
-    G = nx.DiGraph()
-    for n in st.session_state["nodes"]:
-        G.add_node(n["Node Name"])
-    for e in st.session_state["edges"]:
-        G.add_edge(e["From Node"], e["To Node"])
-    pos = nx.spring_layout(G, seed=42)
-    edge_labels = {(e["From Node"], e["To Node"]): f"{e['Length (km)']} km" for e in st.session_state["edges"]}
-    plt.figure(figsize=(7,4))
-    nx.draw(G, pos, with_labels=True, node_color='skyblue', node_size=1300, font_size=11)
-    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_color='crimson')
-    st.pyplot(plt.gcf())
-    plt.close()
-except Exception:
-    st.warning("Matplotlib/networkx required for network visual.")
+    pump_max = {p['id']: p['n_max'] for p in pumps}
+    def n_bounds(m, p, t): return (0, pump_max[p])
+    m.num_pumps = pyo.Var(m.PUMP, m.T, domain=pyo.NonNegativeIntegers, bounds=n_bounds)
 
-# --- RUN OPTIMIZATION ---
-st.header("5️⃣ Run Optimization")
-if st.button("🚀 Run Pipeline Optimization"):
-    with st.spinner("Running full Pyomo MINLP..."):
-        nodes = st.session_state["nodes"]
-        edges = st.session_state["edges"]
-        pump_curves = st.session_state["pump_curves"]
-        res = netmodel.solve_network_pipeline(
-            nodes, edges, pump_curves, dra_cost, diesel_price
-        )
-        st.session_state["results"] = res
-        st.success("Optimization complete!")
+    pump_min_rpm = {p['id']: p['min_rpm'] for p in pumps}
+    pump_max_rpm = {p['id']: p['max_rpm'] for p in pumps}
+    def rpm_bounds(m, p, t): return (0, pump_max_rpm[p])
+    m.pump_rpm = pyo.Var(m.PUMP, m.T, domain=pyo.NonNegativeReals, bounds=rpm_bounds)
+    m.pump_on = pyo.Var(m.PUMP, m.T, domain=pyo.Binary)
 
-# --- OUTPUT TABS ---
-if st.session_state["results"] is not None:
-    node_out, edge_out, total_cost, _, _, _, _ = st.session_state["results"]
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "📋 Summary",
-        "🔗 Edge Details",
-        "💰 Cost",
-        "⚙️ Performance",
-        "🌀 Pump/Curve",
-        "📉 Pressure",
-        "🧊 3D Plots"
-    ])
+    # ---- CONSTRAINTS ----
 
-    # --- SUMMARY TAB ---
-    with tab1:
-        st.markdown("### Node Results")
-        df_nodes = pd.DataFrame(node_out)
-        st.dataframe(df_nodes)
-        st.download_button("Node Results CSV", df_nodes.to_csv(index=False), file_name="node_results.csv")
-        st.success(f"Total Optimized Cost: ₹{total_cost:,.2f} per day")
+    # Flow continuity at each node, each hour
+    def flow_continuity_rule(m, n, t):
+        inflow = sum(m.flow[e, t] for e in m.E if edge_to[e] == n)
+        outflow = sum(m.flow[e, t] for e in m.E if edge_from[e] == n)
+        return inflow == outflow
+    m.flow_balance = pyo.Constraint(m.N, m.T, rule=flow_continuity_rule)
 
-    # --- EDGE TAB ---
-    with tab2:
-        st.markdown("### Edge Results")
-        df_edges = pd.DataFrame(edge_out)
-        st.dataframe(df_edges)
-        st.download_button("Edge Results CSV", df_edges.to_csv(index=False), file_name="edge_results.csv")
+    # Demand fulfillment (over horizon)
+    def demand_satisfaction_rule(m, n):
+        inflow = sum(m.flow[e, t] for e in m.E for t in m.T if edge_to[e] == n)
+        outflow = sum(m.flow[e, t] for e in m.E for t in m.T if edge_from[e] == n)
+        net = inflow - outflow
+        return net == m.demand_vol[n]
+    m.demand_fulfillment = pyo.Constraint(m.demand_nodes, rule=demand_satisfaction_rule)
 
-    # --- COST TAB ---
-    with tab3:
-        st.markdown("### Cost Breakdown")
-        df_edges = pd.DataFrame(edge_out)
-        df_nodes = pd.DataFrame(node_out)
-        if not df_edges.empty:
-            st.bar_chart(df_edges.set_index("From")["Flow (m3/hr)"])
-        st.write("**Power/DRA costs per station:**")
-        cost_rows = []
-        for n in df_nodes.itertuples():
-            if getattr(n, "Is Pump"):
-                cost_rows.append({
-                    "Node": n.Node,
-                   
-                    "Power Cost": getattr(n, "No. Pumps", 0) * diesel_price * 24  # Illustrative, real value from model as needed
-                })
-        if cost_rows:
-            df_cost = pd.DataFrame(cost_rows)
-            st.dataframe(df_cost)
-            st.download_button("Download Cost Breakdown", df_cost.to_csv(index=False), file_name="cost_breakdown.csv")
+    # Pump logic: OFF => RPM and num_pumps zero
+    def pump_rpm_status(m, p, t):
+        return m.pump_rpm[p, t] <= m.pump_on[p, t] * pump_max_rpm[p]
+    m.pump_rpm_status = pyo.Constraint(m.PUMP, m.T, rule=pump_rpm_status)
+    def pump_num_on(m, p, t):
+        return m.num_pumps[p, t] <= m.pump_on[p, t] * pump_max[p]
+    m.pump_num_on = pyo.Constraint(m.PUMP, m.T, rule=pump_num_on)
+
+    # Velocity limits
+    def velocity_limit(m, e, t):
+        d = diameter[e]
+        area = pi * d**2 / 4
+        v = m.flow[e, t] / 3600.0 / area
+        return pyo.inequality(m.min_v, v, m.max_v)
+    m.velocity_limits = pyo.Constraint(m.E, m.T, rule=velocity_limit)
+
+    # Head balance, SDH (including peaks)
+    g = 9.81
+    def sdh_head_rule(m, e, t):
+        from_n = edge_from[e]
+        to_n = edge_to[e]
+        d = diameter[e]
+        rough = roughness[e]
+        L = length[e]
+        rho = density[from_n]
+        kv = viscosity[from_n]
+        Q = m.flow[e, t]
+        area = pi * d**2 / 4
+        v = Q / 3600.0 / area
+        Re = v * d / (kv * 1e-6) if kv > 0 else 1e6
+        if Re < 4000:
+            f = 64 / max(Re, 1e-6)
         else:
-            st.info("No cost data for this run.")
+            arg = rough/d/3.7 + 5.74/(Re**0.9)
+            f = 0.25 / (log10(arg)**2) if arg > 0 else 0.015
+        DR_frac = m.dra[e, t]/100.0
+        loss = f * (L/d) * (v**2/(2*g)) * (1-DR_frac)
+        # Peaks logic
+        if e in edge_peaks:
+            for pk in edge_peaks[e]:
+                pk_loss = f * ((pk['location_km']*1000)/d) * (v**2/(2*g)) * (1-DR_frac)
+                loss = max(loss, (pk['elevation_m'] - elev[from_n]) + pk_loss + 50)
+        # Pump head
+        pump_head = 0
+        for p in pumps:
+            if pump_node[p['id']] == from_n and pump_branch_to[p['id']] == to_n:
+                a, b, c = p['A'], p['B'], p['C']
+                pump_rpm = m.pump_rpm[p['id'], t]
+                dol = p['max_rpm']
+                H = (a*Q**2 + b*Q + c)*(pump_rpm/dol)**2 if dol > 0 else 0
+                n_pump = m.num_pumps[p['id'], t]
+                pump_head += H * n_pump
+        return m.rh[from_n, t] + pump_head >= m.rh[to_n, t] + loss
+    m.head_balance = pyo.Constraint(m.E, m.T, rule=sdh_head_rule)
 
-    # --- PERFORMANCE TAB ---
-    with tab4:
-        st.markdown("### Performance Summary")
-        df_edges = pd.DataFrame(edge_out)
-        if not df_edges.empty:
-            st.line_chart(df_edges[["Flow (m3/hr)", "Velocity (m/s)", "Reynolds"]])
-        st.info("Review flow, velocity, and Reynolds for all segments.")
+    # ---- OBJECTIVE FUNCTION ----
+    # Minimize total cost (power/fuel + DRA) over all hours
+    def total_cost_rule(m):
+        total_cost = 0
+        for p in pumps:
+            pid = p['id']
+            node_id = pump_node[pid]
+            power_type = p['power_type']
+            a, b, c = p['A'], p['B'], p['C']
+            P, Qc, R, S, T = p['P'], p['Q'], p['R'], p['S'], p['T']
+            dol = p['max_rpm']
+            sfc = p.get('sfc', 0)
+            rate = p.get('grid_rate', 0)
+            for t in range(1, time_horizon_hours+1):
+                # Identify main edge
+                edges_out = [e for e in edges if edge_from[e['id']] == node_id and edge_to[e['id']] == pump_branch_to[pid]]
+                if not edges_out: continue
+                eid = edges_out[0]['id']
+                Q = m.flow[eid, t]
+                pump_rpm = m.pump_rpm[pid, t]
+                n_pump = m.num_pumps[pid, t]
+                H = (a*Q**2 + b*Q + c)*(pump_rpm/dol)**2 if dol > 0 else 0
+                Qe = Q * dol/pump_rpm if pump_rpm > 0 else Q
+                eff = (P*Qe**4 + Qc*Qe**3 + R*Qe**2 + S*Qe + T)/100.0 if pump_rpm > 0 else 0.5
+                eff = max(0.05, eff)
+                rho_val = density[node_id]
+                pwr_kW = (rho_val * Q * 9.81 * H * n_pump)/(3600.0 * 1000.0 * eff * 0.95)
+                if power_type.lower() == "grid":
+                    cost = pwr_kW * grid_price
+                else:
+                    fuel_per_kWh = (sfc*1.34102)/820.0
+                    cost = pwr_kW * fuel_per_kWh * diesel_price
+                total_cost += cost
+        # Add DRA cost
+        for e in edges:
+            eid = e['id']
+            for t in range(1, time_horizon_hours+1):
+                # Assume dra (%) = ppm (for illustration; can add proper DRA curve logic)
+                dra_ppm = m.dra[eid, t]
+                Q = m.flow[eid, t]
+                dra_vol = dra_ppm * Q * 1000.0 / 1e6  # L/hr (if ppm = mg/L and flow in m3/hr)
+                dra_cost = dra_vol * dra_cost_per_litre
+                total_cost += dra_cost
+        return total_cost
+    m.total_cost = pyo.Objective(rule=total_cost_rule, sense=pyo.minimize)
 
-    # --- PUMP/CURVE TAB ---
-    with tab5:
-        st.markdown("### Pump Characteristic/Efficiency Curves")
-        for n in st.session_state["nodes"]:
-            if n["Is Pump?"] == "Yes" and n["Node Name"] in st.session_state["pump_curves"]:
-                dfh, dfe = st.session_state["pump_curves"][n["Node Name"]]
-                fig1 = go.Figure()
-                fig1.add_trace(go.Scatter(x=dfh.iloc[:,0], y=dfh.iloc[:,1], mode='lines+markers', name="Head Curve"))
-                fig1.update_layout(title=f"Flow vs Head: {n['Node Name']}", xaxis_title="Flow (m3/hr)", yaxis_title="Head (m)")
-                st.plotly_chart(fig1, use_container_width=True)
+    # ---- SOLVE ----
+    results = SolverManagerFactory('neos').solve(m, solver='bonmin', tee=True)
+    m.solutions.load_from(results)
 
-                fig2 = go.Figure()
-                fig2.add_trace(go.Scatter(x=dfe.iloc[:,0], y=dfe.iloc[:,1], mode='lines+markers', name="Efficiency Curve"))
-                fig2.update_layout(title=f"Flow vs Efficiency: {n['Node Name']}", xaxis_title="Flow (m3/hr)", yaxis_title="Efficiency (%)")
-                st.plotly_chart(fig2, use_container_width=True)
-
-    # --- PRESSURE TAB ---
-    with tab6:
-        st.markdown("### Pressure/Head Profile")
-        # For simplicity, show residual head at each node, can extend to length-based profile later
-        df_nodes = pd.DataFrame(node_out)
-        if not df_nodes.empty:
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=df_nodes["Node"],
-                y=df_nodes["Residual Head"],
-                mode="lines+markers",
-                name="Residual Head"
-            ))
-            fig.update_layout(title="Residual Head per Node", xaxis_title="Node", yaxis_title="Head (m)")
-            st.plotly_chart(fig, use_container_width=True)
-
-    # --- 3D TAB ---
-    with tab7:
-        st.markdown("### 3D Parameter Sensitivity & Surface Plots")
-        # Only pump nodes are relevant
-        pump_nodes = [n["Node"] for n in node_out if n["Is Pump"]]
-        if not pump_nodes:
-            st.info("No pump stations found in this case.")
-        else:
-            selected_node = st.selectbox("Select Pump Node for 3D Plot", pump_nodes)
-            node_row = next(n for n in node_out if n["Node"] == selected_node)
-            if selected_node not in st.session_state["pump_curves"]:
-                st.warning("Upload pump curves for this node for advanced plotting.")
-            else:
-                dfh, dfe = st.session_state["pump_curves"][selected_node]
-                # Fit pump curves
-                A, B, C = np.polyfit(dfh.iloc[:,0], dfh.iloc[:,1], 2)
-                P, Qc, R, S, T = np.polyfit(dfe.iloc[:,0], dfe.iloc[:,1], 4)
-                rpm_min = int(node_row["Pump RPM"]) if node_row["Pump RPM"] > 0 else 1000
-                rpm_max = int(node_row["Pump RPM"]+200) if node_row["Pump RPM"] > 0 else 1500
-                flow_range = np.linspace(dfh.iloc[:,0].min(), dfh.iloc[:,0].max(), 50)
-                speed_range = np.linspace(rpm_min, rpm_max, 20)
-                X, Y = np.meshgrid(flow_range, speed_range)
-                Z_head = (A*X**2 + B*X + C)*(Y/rpm_max)**2
-                Q_adj = X * rpm_max / Y
-                Z_eff = (P*Q_adj**4 + Qc*Q_adj**3 + R*Q_adj**2 + S*Q_adj + T)
-                rho = node_row["Density"]
-                g = 9.81
-                Z_eff_nonzero = np.where(Z_eff < 0.1, 0.1, Z_eff)
-                Z_power = (rho * X * g * Z_head)/(3600*Z_eff_nonzero*0.95*1000) * 24 * diesel_price
-                plot_type = st.selectbox("Surface Type", ["Head (m)", "Efficiency (%)", "Power Cost (₹/day)"])
-                fig = go.Figure()
-                if plot_type == "Head (m)":
-                    fig.add_trace(go.Surface(x=flow_range, y=speed_range, z=Z_head, colorscale='Viridis'))
-                    fig.update_layout(title="Head vs Flow vs Speed", scene={"xaxis_title":"Flow (m³/hr)","yaxis_title":"RPM","zaxis_title":"Head (m)"})
-                elif plot_type == "Efficiency (%)":
-                    fig.add_trace(go.Surface(x=flow_range, y=speed_range, z=Z_eff, colorscale='Viridis'))
-                    fig.update_layout(title="Efficiency vs Flow vs Speed", scene={"xaxis_title":"Flow (m³/hr)","yaxis_title":"RPM","zaxis_title":"Efficiency (%)"})
-                elif plot_type == "Power Cost (₹/day)":
-                    fig.add_trace(go.Surface(x=flow_range, y=speed_range, z=Z_power, colorscale='Viridis'))
-                    fig.update_layout(title="Power Cost vs Flow vs Speed", scene={"xaxis_title":"Flow (m³/hr)","yaxis_title":"RPM","zaxis_title":"Cost (₹/day)"})
-                st.plotly_chart(fig, use_container_width=True)
-
-# --- END ---
-
-st.markdown(
-    """
-    <div style='text-align: center; color: gray; margin-top: 2em; font-size: 0.9em;'>
-    &copy; 2025 Pipeline Optima™ Network Edition. Developed by Parichay Das. All rights reserved.
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+    # ---- EXTRACT RESULTS ----
+    # All variables returned as: results_dict["flow"][(edge_id, t)] = value, etc.
+    results_dict = {
+        "flow": {(e, t): pyo.value(m.flow[e, t]) for e in m.E for t in m.T},
+        "dra": {(e, t): pyo.value(m.dra[e, t]) for e in m.E for t in m.T},
+        "residual_head": {(n, t): pyo.value(m.rh[n, t]) for n in m.N for t in m.T},
+        "pump_on": {(p, t): int(pyo.value(m.pump_on[p, t])) for p in m.PUMP for t in m.T},
+        "pump_rpm": {(p, t): pyo.value(m.pump_rpm[p, t]) for p in m.PUMP for t in m.T},
+        "num_pumps": {(p, t): int(pyo.value(m.num_pumps[p, t])) for p in m.PUMP for t in m.T},
+        "total_cost": pyo.value(m.total_cost)
+    }
+    return results_dict
