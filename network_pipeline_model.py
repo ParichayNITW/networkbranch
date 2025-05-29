@@ -9,7 +9,7 @@ from math import pi
 from io import BytesIO
 from fpdf import FPDF
 import networkx as nx
-from network_batch_pipeline_model import solve_batch_pipeline  # Make sure backend is present!
+from network_pipeline_model import solve_pipeline  # Make sure backend is present!
 
 st.set_page_config(page_title="Pipeline Optima™ Network Batch Scheduler", layout="wide")
 
@@ -163,7 +163,7 @@ if len(nodes) >= 2 and len(edges) >= 1:
 # ---- RUN OPTIMIZATION ----
 if st.button("🚀 Run Batch Network Optimization"):
     with st.spinner("Running MINLP solver..."):
-        results = solve_batch_pipeline(
+        results = solve_pipeline(
             nodes, edges, pumps, peaks, demands, int(time_horizon),
             dra_cost, diesel_price, grid_price, min_v, max_v
         )
