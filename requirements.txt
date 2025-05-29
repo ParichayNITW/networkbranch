@@ -5,3 +5,4 @@ pyomo
 networkx
 matplotlib
 plotly
+fpdf
